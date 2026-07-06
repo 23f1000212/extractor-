@@ -1,107 +1,130 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import re
+import uuid
+import time
 
 app = FastAPI()
 
+# -----------------------------
+# CORS
+# -----------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Change to exam origin if required
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class ExtractRequest(BaseModel):
-    text: str
+TOTAL_ORDERS = 59
+RATE_LIMIT = 17
+WINDOW_SECONDS = 10
+
+# In-memory stores
+idempotency_store = {}
+rate_limit_store = {}
 
 
-class Invoice(BaseModel):
-    vendor: str
-    amount: float
-    currency: str
-    date: str
+class OrderRequest(BaseModel):
+    product: str = ""
+    quantity: int = 1
 
 
-@app.post("/extract", response_model=Invoice)
-async def extract(req: ExtractRequest):
-    try:
-        text = req.text.strip()
+# -----------------------------
+# POST /orders
+# -----------------------------
+@app.post("/orders", status_code=201)
+async def create_order(request: Request, order: OrderRequest):
 
-        if not text:
-            return Invoice(
-                vendor="",
-                amount=0.0,
-                currency="",
-                date=""
-            )
+    client_id = request.headers.get("X-Client-Id", "anonymous")
+    idem_key = request.headers.get("Idempotency-Key")
 
-        # -------------------------
-        # DATE
-        # -------------------------
-        date = ""
-        m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
-        if m:
-            date = m.group(1)
+    # -----------------------------
+    # Rate Limiting
+    # -----------------------------
+    now = time.time()
 
-        # -------------------------
-        # CURRENCY
-        # -------------------------
-        currency = ""
-        m = re.search(r"\b(USD|EUR|GBP|INR|AUD|CAD|JPY|CHF)\b", text, re.I)
-        if m:
-            currency = m.group(1).upper()
+    timestamps = rate_limit_store.get(client_id, [])
 
-        # -------------------------
-        # AMOUNT
-        # -------------------------
-        amount = 0.0
+    timestamps = [
+        t for t in timestamps
+        if now - t < WINDOW_SECONDS
+    ]
 
-        patterns = [
-            r"(?:TOTAL\s+DUE|TOTAL|AMOUNT\s+DUE|AMOUNT|BALANCE)\D*([0-9]+(?:\.[0-9]{1,2})?)",
-            r"(?:USD|EUR|GBP|INR|AUD|CAD|JPY|CHF)\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            r"[$€£]\s*([0-9]+(?:\.[0-9]{1,2})?)",
-        ]
-
-        for p in patterns:
-            m = re.search(p, text, re.I)
-            if m:
-                amount = float(m.group(1))
-                break
-
-        # -------------------------
-        # VENDOR
-        # -------------------------
-
-        vendor = ""
-
-        vendor_patterns = [
-            r"Vendor[:\s]+(.+)",
-            r"Supplier[:\s]+(.+)",
-            r"From[:\s]+(.+)",
-            r"Bill From[:\s]+(.+)",
-            r"Invoice From[:\s]+(.+)",
-        ]
-
-        for pat in vendor_patterns:
-            m = re.search(pat, text, re.I)
-            if m:
-                vendor = m.group(1).split("\n")[0].strip()
-                break
-
-        if not vendor:
-            m = re.search(
-                r"([A-Za-z0-9&.,' -]*(?:Ltd|LLC|Inc|Corporation|Industries|Company|Co\.?))",
-                text,
-                re.I,
-            )
-            if m:
-                vendor = m.group(1).strip()
-
-        return Invoice(
-            vendor=vendor,
-            amount=amount,
-            currency=currency,
-            date=date,
+    if len(timestamps) >= RATE_LIMIT:
+        return JSONResponse(
+            status_code=429,
+            headers={
+                "Retry-After": str(WINDOW_SECONDS)
+            },
+            content={
+                "detail": "Rate limit exceeded"
+            }
         )
 
-    except Exception:
-        return Invoice(
-            vendor="",
-            amount=0.0,
-            currency="",
-            date=""
-        )
+    timestamps.append(now)
+    rate_limit_store[client_id] = timestamps
+
+    # -----------------------------
+    # Idempotency
+    # -----------------------------
+    if idem_key and idem_key in idempotency_store:
+        return idempotency_store[idem_key]
+
+    order_data = {
+        "id": str(uuid.uuid4()),
+        "product": order.product,
+        "quantity": order.quantity
+    }
+
+    if idem_key:
+        idempotency_store[idem_key] = order_data
+
+    return JSONResponse(
+        status_code=201,
+        content=order_data
+    )
+
+
+# -----------------------------
+# GET /orders
+# -----------------------------
+@app.get("/orders")
+async def get_orders(
+    limit: int = 10,
+    cursor: str | None = None
+):
+
+    start = int(cursor) if cursor else 0
+
+    end = min(start + limit, TOTAL_ORDERS)
+
+    items = []
+
+    for i in range(start + 1, end + 1):
+        items.append({
+            "id": i
+        })
+
+    next_cursor = None
+
+    if end < TOTAL_ORDERS:
+        next_cursor = str(end)
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor
+    }
+
+
+# -----------------------------
+# Health Check
+# -----------------------------
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "message": "Orders API is running"
+    }
